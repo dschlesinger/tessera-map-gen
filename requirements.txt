@@ -1,0 +1,9 @@
+geotessera>=1.1
+pystac-client
+planetary-computer
+rasterio
+numpy
+scikit-learn
+scikit-image
+torch
+tqdm
