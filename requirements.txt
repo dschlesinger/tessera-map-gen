@@ -8,3 +8,4 @@ scikit-image
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.13.0+cu126
 tqdm
+flask
