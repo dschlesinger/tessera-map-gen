@@ -5,5 +5,6 @@
 #$ -N train-diffusion   # Give job a name
 #$ -j y                 # Merge the error and output streams into a single file
 #$ -l gpu=1             # Request 1 GPU
+#$ -l gpu_c=7.0         # Require compute capability >= 7.0 (avoids old-GPU cuDNN mismatch)
 
 .venv/bin/python train_diffusion_decoder.py

@@ -71,6 +71,9 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}, compute capability {torch.cuda.get_device_capability(0)}")
+        torch.backends.cudnn.benchmark = False
 
     train_ds, val_ds = load_patches()
     print(f"Train patches: {len(train_ds)}, val patches: {len(val_ds)}")
