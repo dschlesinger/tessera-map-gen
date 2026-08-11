@@ -25,6 +25,7 @@ import rasterio
 from geotessera import GeoTessera
 from rasterio.enums import Resampling
 from rasterio.merge import merge
+from rasterio.vrt import WarpedVRT
 from rasterio.warp import reproject
 
 import config
@@ -46,10 +47,13 @@ def fetch_embeddings():
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = gt.export_embedding_geotiffs(tiles_to_fetch=tiles, output_dir=tmp, bands=None)
-        srcs = [rasterio.open(p) for p in paths]
-        mosaic, transform = merge(srcs)
-        crs = srcs[0].crs
-        for s in srcs:
+        opened = [rasterio.open(p) for p in paths]
+        crs = opened[0].crs
+        vrts = [WarpedVRT(s, crs=crs, resampling=Resampling.bilinear) for s in opened]
+        mosaic, transform = merge(vrts)
+        for v in vrts:
+            v.close()
+        for s in opened:
             s.close()
 
     # merge() returns (bands, H, W); embeddings are stored as 128 bands -> move to (H, W, 128).
