@@ -133,14 +133,14 @@ const map = L.map('map', {crs: L.CRS.Simple, minZoom: 0, maxZoom: 0}).setView([0
 let layer;
 function setLayer(model) {
   if (layer) map.removeLayer(layer);
-  layer = L.tileLayer(`/tile/${model}/{x}/{y}.png`, {tileSize: %(tile_size)d, noWrap: false}).addTo(map);
+  layer = L.tileLayer(`/tile/${model}/{x}/{y}.png`, {tileSize: __TILE_SIZE__, noWrap: false}).addTo(map);
 }
 setLayer('onestep');
 document.getElementById('model').addEventListener('change', e => setLayer(e.target.value));
 </script>
 </body>
 </html>
-""" % {"tile_size": config.GEN_TILE_SIZE}
+""".replace("__TILE_SIZE__", str(config.GEN_TILE_SIZE))
 
 
 @app.route("/")
