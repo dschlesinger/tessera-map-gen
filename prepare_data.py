@@ -2,11 +2,13 @@
 
 Run once before either training script. Steps:
   1. Install pipeline dependencies (pip install -r requirements.txt).
-  2. Download Tessera embedding tiles + a matching Sentinel-2 RGB composite for BBOX/YEAR,
-     reprojected onto the same pixel grid as the embeddings.
-  3. Parse into a fixed non-overlapping patch grid, split train/val, and compute embedding
-     normalization stats -- all cached to disk so the training scripts only need to load,
-     never recompute.
+  2. For each region in config.REGIONS, download Tessera embedding tiles + a matching
+     Sentinel-2 RGB composite, reprojected onto the same pixel grid as the embeddings.
+     Multiple small regions (city/hills/forest/coast) instead of one big area keeps the
+     download to a few GB while still giving the decoder terrain variety to learn from.
+  3. Build a non-overlapping patch grid per region, pool all regions' patches into one
+     train/val split, and compute embedding normalization stats -- all cached to disk so
+     the training scripts only need to load, never recompute.
 
 Not run locally in this session -- executed on cloud compute by the user.
 """
@@ -37,13 +39,13 @@ def install_requirements():
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_path])
 
 
-def fetch_embeddings():
-    """Download Tessera embedding tiles for BBOX/YEAR and mosaic into one array.
+def fetch_embeddings(bbox):
+    """Download Tessera embedding tiles for one region's bbox and mosaic into one array.
 
     Returns (embedding, transform, crs) where embedding has shape (H, W, 128).
     """
     gt = GeoTessera()
-    tiles = gt.registry.load_blocks_for_region(bounds=config.BBOX, year=config.YEAR)
+    tiles = gt.registry.load_blocks_for_region(bounds=bbox, year=config.YEAR)
 
     with tempfile.TemporaryDirectory() as tmp:
         paths = gt.export_embedding_geotiffs(tiles_to_fetch=tiles, output_dir=tmp, bands=None)
@@ -61,7 +63,7 @@ def fetch_embeddings():
     return embedding, transform, crs
 
 
-def fetch_rgb_composite(out_shape, transform, crs, max_cloud_cover=20, max_scenes=6):
+def fetch_rgb_composite(bbox, out_shape, transform, crs, max_cloud_cover=20, max_scenes=6):
     """Fetch a low-cloud Sentinel-2 RGB composite reprojected onto the embedding grid.
 
     out_shape: (H, W) to match the embedding array.
@@ -70,7 +72,7 @@ def fetch_rgb_composite(out_shape, transform, crs, max_cloud_cover=20, max_scene
     catalog = pystac_client.Client.open("https://planetarycomputer.microsoft.com/api/stac/v1")
     search = catalog.search(
         collections=["sentinel-2-l2a"],
-        bbox=config.BBOX,
+        bbox=bbox,
         datetime=f"{config.YEAR}-01-01/{config.YEAR}-12-31",
         query={"eo:cloud_cover": {"lt": max_cloud_cover}},
         sortby=[{"field": "properties.eo:cloud_cover", "direction": "asc"}],
@@ -79,7 +81,7 @@ def fetch_rgb_composite(out_shape, transform, crs, max_cloud_cover=20, max_scene
     items = list(search.item_collection())
     if not items:
         raise RuntimeError(
-            f"No Sentinel-2 scenes found for {config.BBOX} in {config.YEAR} "
+            f"No Sentinel-2 scenes found for {bbox} in {config.YEAR} "
             f"under {max_cloud_cover}% cloud cover."
         )
 
@@ -116,12 +118,19 @@ def _patch_grid(height, width, patch_size):
     return [(y, x) for y in ys for x in xs]
 
 
-def parse_and_split(embedding):
-    """Build the non-overlapping patch grid, split train/val, compute embedding
-    normalization stats (channel mean/std) from a sample of training patches only,
-    so validation patches never leak into the stats used at training time."""
-    height, width = embedding.shape[:2]
-    coords = _patch_grid(height, width, config.PATCH_SIZE)
+def parse_and_split(embeddings):
+    """Build the non-overlapping patch grid for each region, pool all regions' patches
+    into one shuffled train/val split, and compute embedding normalization stats
+    (channel mean/std) from a sample of training patches only, so validation patches
+    never leak into the stats used at training time.
+
+    Returns (train_coords, val_coords) as (N, 3) arrays of (region_idx, y, x), plus
+    (mean, std).
+    """
+    coords = []
+    for region_idx, embedding in enumerate(embeddings):
+        height, width = embedding.shape[:2]
+        coords.extend((region_idx, y, x) for y, x in _patch_grid(height, width, config.PATCH_SIZE))
 
     rng = np.random.default_rng(config.RANDOM_SEED)
     rng.shuffle(coords)
@@ -131,10 +140,10 @@ def parse_and_split(embedding):
 
     sample_idx = np.linspace(0, len(train_coords) - 1, min(200, len(train_coords)), dtype=int)
     sample_vecs = []
+    p = config.PATCH_SIZE
     for i in sample_idx:
-        y, x = train_coords[i]
-        p = config.PATCH_SIZE
-        sample_vecs.append(embedding[y : y + p, x : x + p, :].reshape(-1, config.EMBEDDING_DIM))
+        region_idx, y, x = train_coords[i]
+        sample_vecs.append(embeddings[region_idx][y : y + p, x : x + p, :].reshape(-1, config.EMBEDDING_DIM))
     sample_vecs = np.concatenate(sample_vecs, axis=0)
     mean = sample_vecs.mean(axis=0)
     std = sample_vecs.std(axis=0)
@@ -156,36 +165,35 @@ def main():
     os.makedirs(config.DATA_DIR, exist_ok=True)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
 
-    print(f"Fetching Tessera embeddings for {config.BBOX}, {config.YEAR}...")
-    embedding, transform, crs = fetch_embeddings()
-    print(f"Embedding grid: {embedding.shape}")
+    embeddings, region_meta = [], []
+    for i, (name, bbox) in enumerate(config.REGIONS):
+        print(f"[{i + 1}/{len(config.REGIONS)}] Fetching Tessera embeddings for {name} {bbox}, {config.YEAR}...")
+        embedding, transform, crs = fetch_embeddings(bbox)
+        print(f"  embedding grid: {embedding.shape}")
 
-    print("Fetching matching Sentinel-2 RGB composite...")
-    rgb = fetch_rgb_composite(embedding.shape[:2], transform, crs)
-    print(f"RGB grid: {rgb.shape}")
+        print(f"[{i + 1}/{len(config.REGIONS)}] Fetching matching Sentinel-2 RGB composite for {name}...")
+        rgb = fetch_rgb_composite(bbox, embedding.shape[:2], transform, crs)
+        print(f"  RGB grid: {rgb.shape}")
 
-    print("Parsing into patch grid, train/val split, normalization stats...")
-    train_coords, val_coords, mean, std = parse_and_split(embedding)
+        np.save(config.embedding_cache(i), embedding)
+        np.save(config.rgb_cache(i), rgb)
+        embeddings.append(embedding)
+        region_meta.append(
+            {"name": name, "bbox": list(bbox), "crs": str(crs), "transform": list(transform)[:6], "shape": list(embedding.shape)}
+        )
+
+    print("Parsing into patch grids, pooled train/val split, normalization stats...")
+    train_coords, val_coords, mean, std = parse_and_split(embeddings)
     print(f"Train patches: {len(train_coords)}, val patches: {len(val_coords)}")
 
-    np.save(config.EMBEDDING_CACHE, embedding)
-    np.save(config.RGB_CACHE, rgb)
     np.save(f"{config.DATA_DIR}/train_coords.npy", train_coords)
     np.save(f"{config.DATA_DIR}/val_coords.npy", val_coords)
     with open(f"{config.DATA_DIR}/norm_stats.json", "w") as f:
         json.dump({"mean": mean.tolist(), "std": std.tolist()}, f)
+    with open(config.REGIONS_FILE, "w") as f:
+        json.dump({"names": [name for name, _ in config.REGIONS]}, f, indent=2)
     with open(config.METADATA_CACHE, "w") as f:
-        json.dump(
-            {
-                "bbox": config.BBOX,
-                "year": config.YEAR,
-                "crs": str(crs),
-                "transform": list(transform)[:6],
-                "shape": list(embedding.shape),
-            },
-            f,
-            indent=2,
-        )
+        json.dump({"year": config.YEAR, "regions": region_meta}, f, indent=2)
 
     print(f"Done. Cached to {config.DATA_DIR}/ -- ready for train_onestep_decoder.py / train_diffusion_decoder.py")
 

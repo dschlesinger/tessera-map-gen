@@ -22,8 +22,9 @@ import json
 
 import numpy as np
 import torch
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
+import classify
 import config
 import field
 from generate_novel import to_uint8_image
@@ -37,16 +38,27 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _state = {"models": {}, "tile_cache": {}}
 
 
-def load_field_inputs():
-    embedding = np.load(config.EMBEDDING_CACHE)
-    train_coords = np.load(f"{config.DATA_DIR}/train_coords.npy")
+def load_all_regions():
+    with open(config.REGIONS_FILE) as f:
+        n_regions = len(json.load(f)["names"])
     with open(f"{config.DATA_DIR}/norm_stats.json") as f:
         stats = json.load(f)
     mean = np.array(stats["mean"], dtype=np.float32)
     std = np.array(stats["std"], dtype=np.float32)
-    embedding_norm = (embedding - mean) / std
-    pca_mean, components, explained_variance = field.fit_or_load_pca(embedding_norm, train_coords, device=DEVICE)
-    return embedding_norm, pca_mean, components, explained_variance
+
+    embeddings_norm = [(np.load(config.embedding_cache(i)) - mean) / std for i in range(n_regions)]
+    train_coords = np.load(f"{config.DATA_DIR}/train_coords.npy")
+    return embeddings_norm, train_coords
+
+
+def load_field_inputs(embeddings_norm, train_coords):
+    """PCA is fit pooling pixels across every region (terrain variety), but the live
+    map's real-crop grounding texture is tiled from a single region (config.
+    GROUNDING_REGION_INDEX) to avoid a visible seam where it would otherwise jump
+    between terrain types."""
+    pca_mean, components, explained_variance = field.fit_or_load_pca(embeddings_norm, train_coords, device=DEVICE)
+    grounding = embeddings_norm[config.GROUNDING_REGION_INDEX]
+    return grounding, pca_mean, components, explained_variance
 
 
 def get_onestep():
@@ -91,8 +103,19 @@ def render_tile(model_name, tile_x, tile_y):
             pred_full = model(emb_tensor)[0]
 
     crop = pred_full[:, margin : margin + size, margin : margin + size]
+    img = to_uint8_image(crop)
+
+    centers, threshold = _state["classify"]
+    visible_grid = grid[margin : margin + size, margin : margin + size, :]
+    if classify.novelty_score(visible_grid, centers, device=DEVICE) < threshold:
+        b = config.NOVELTY_BORDER_PX
+        img[:b, :, :] = [255, 0, 0]
+        img[-b:, :, :] = [255, 0, 0]
+        img[:, :b, :] = [255, 0, 0]
+        img[:, -b:, :] = [255, 0, 0]
+
     buf = io.BytesIO()
-    imsave(buf, to_uint8_image(crop), format="png", check_contrast=False)
+    imsave(buf, img, format="png", check_contrast=False)
     return buf.getvalue()
 
 
@@ -102,6 +125,39 @@ def tile(model_name, x, y):
     if key not in _state["tile_cache"]:
         _state["tile_cache"][key] = render_tile(model_name, x, y)
     return Response(_state["tile_cache"][key], mimetype="image/png")
+
+
+@app.route("/heatmap/<int:x>/<int:y>.png")
+def heatmap(x, y):
+    size = config.GEN_TILE_SIZE
+    embedding_norm, pca_mean, components, explained_variance = _state["field_inputs"]
+    grid = field.embedding_window(x * size, y * size, size, size, pca_mean, components, explained_variance, embedding_norm)
+
+    centers, _ = _state["classify"]
+    colors = classify.classify_grid(grid, centers, _state["labels"], device=DEVICE)
+    alpha = np.full((size, size, 1), 160, dtype=np.uint8)
+    rgba = np.concatenate([colors, alpha], axis=-1)
+
+    buf = io.BytesIO()
+    imsave(buf, rgba, format="png", check_contrast=False)
+    return Response(buf.getvalue(), mimetype="image/png")
+
+
+@app.route("/label", methods=["POST"])
+def add_label():
+    payload = request.get_json(force=True)
+    x, y = int(payload["x"]), int(payload["y"])
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "empty name"}), 400
+
+    embedding_norm, pca_mean, components, explained_variance = _state["field_inputs"]
+    patch = field.embedding_window(x - 4, y - 4, 8, 8, pca_mean, components, explained_variance, embedding_norm)
+    vector = patch.reshape(-1, config.EMBEDDING_DIM).mean(axis=0).tolist()
+
+    _state["labels"].append({"x": x, "y": y, "name": name, "vector": vector})
+    classify.save_labels(_state["labels"])
+    return jsonify({"ok": True, "n_labels": len(_state["labels"])})
 
 
 PAGE = """
@@ -114,8 +170,11 @@ PAGE = """
 <style>
   html, body { margin: 0; height: 100%; font-family: sans-serif; }
   #controls { position: absolute; z-index: 1000; top: 10px; left: 50px; background: white;
-              padding: 6px 10px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.3); }
+              padding: 6px 10px; border-radius: 4px; box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+              display: flex; gap: 10px; align-items: center; flex-wrap: wrap; max-width: 70vw; }
   #map { height: 100%; background: #111; }
+  #map.labeling { cursor: crosshair; }
+  #controls span { font-size: 12px; color: #555; }
 </style>
 </head>
 <body>
@@ -126,17 +185,59 @@ PAGE = """
         <option value="diffusion">Diffusion</option>
       </select>
     </label>
+    <label><input type="checkbox" id="heatmap-toggle"> Region heatmap</label>
+    <button id="label-btn">Add label</button>
+    <span>Red border = tile close to a real observed location</span>
   </div>
   <div id="map"></div>
 <script>
 const map = L.map('map', {crs: L.CRS.Simple, minZoom: 0, maxZoom: 0}).setView([0, 0], 0);
-let layer;
+let layer, heatLayer;
+let heatmapOn = false;
+let heatmapVersion = 0;
+let labeling = false;
+
 function setLayer(model) {
   if (layer) map.removeLayer(layer);
   layer = L.tileLayer(`/tile/${model}/{x}/{y}.png`, {tileSize: __TILE_SIZE__, noWrap: false}).addTo(map);
 }
 setLayer('onestep');
+
+function refreshHeatmap() {
+  if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
+  if (heatmapOn) {
+    heatLayer = L.tileLayer(`/heatmap/{x}/{y}.png?v=${heatmapVersion}`, {tileSize: __TILE_SIZE__, noWrap: false, opacity: 0.6}).addTo(map);
+  }
+}
+
 document.getElementById('model').addEventListener('change', e => setLayer(e.target.value));
+document.getElementById('heatmap-toggle').addEventListener('change', e => { heatmapOn = e.target.checked; refreshHeatmap(); });
+
+const labelBtn = document.getElementById('label-btn');
+labelBtn.addEventListener('click', () => {
+  labeling = !labeling;
+  labelBtn.textContent = labeling ? 'Click map to label...' : 'Add label';
+  document.getElementById('map').classList.toggle('labeling', labeling);
+});
+
+map.on('click', async (e) => {
+  if (!labeling) return;
+  labeling = false;
+  labelBtn.textContent = 'Add label';
+  document.getElementById('map').classList.remove('labeling');
+
+  const name = prompt('Label this region (e.g. city, lake, hill):');
+  if (!name) return;
+
+  const pt = map.project(e.latlng, 0);
+  await fetch('/label', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x: Math.round(pt.x), y: Math.round(pt.y), name}),
+  });
+  heatmapVersion++;
+  refreshHeatmap();
+});
 </script>
 </body>
 </html>
@@ -149,7 +250,16 @@ def index():
 
 
 if __name__ == "__main__":
-    print("Loading data and fitting/loading PCA...")
-    _state["field_inputs"] = load_field_inputs()
+    print("Loading regions...")
+    embeddings_norm, train_coords = load_all_regions()
+
+    print("Fitting/loading PCA (pooled across all regions)...")
+    _state["field_inputs"] = load_field_inputs(embeddings_norm, train_coords)
+
+    print("Building/loading region-classifier reference bank...")
+    _state["classify"] = classify.build_or_load_bank(embeddings_norm, train_coords, device=DEVICE)
+    _state["labels"] = classify.load_labels()
+    print(f"  {len(_state['labels'])} saved label(s) loaded")
+
     print("Ready.")
     app.run(host="0.0.0.0", port=5000)

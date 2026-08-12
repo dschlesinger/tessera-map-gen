@@ -34,16 +34,21 @@ def to_uint8_image(rgb_tensor):
 
 
 def load_field_inputs(device):
-    embedding = np.load(config.EMBEDDING_CACHE)
-    train_coords = np.load(f"{config.DATA_DIR}/train_coords.npy")
+    """PCA is fit pooling pixels across every region (terrain variety); the returned
+    embedding_norm used for real-crop grounding is a single region (config.
+    GROUNDING_REGION_INDEX) to keep it spatially coherent for periodic tiling."""
+    with open(config.REGIONS_FILE) as f:
+        n_regions = len(json.load(f)["names"])
     with open(f"{config.DATA_DIR}/norm_stats.json") as f:
         stats = json.load(f)
     mean = np.array(stats["mean"], dtype=np.float32)
     std = np.array(stats["std"], dtype=np.float32)
-    embedding_norm = (embedding - mean) / std
 
-    pca_mean, components, explained_variance = field.fit_or_load_pca(embedding_norm, train_coords, device=device)
-    return embedding_norm, pca_mean, components, explained_variance
+    embeddings_norm = [(np.load(config.embedding_cache(i)) - mean) / std for i in range(n_regions)]
+    train_coords = np.load(f"{config.DATA_DIR}/train_coords.npy")
+
+    pca_mean, components, explained_variance = field.fit_or_load_pca(embeddings_norm, train_coords, device=device)
+    return embeddings_norm[config.GROUNDING_REGION_INDEX], pca_mean, components, explained_variance
 
 
 def main():

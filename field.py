@@ -36,26 +36,39 @@ from scipy.interpolate import RegularGridInterpolator
 import config
 
 
-def fit_or_load_pca(embedding_norm, train_coords, k=config.PCA_COMPONENTS, seed=0,
-                     path=config.PCA_CACHE, device="cpu", max_pixels=200_000):
-    """Fit PCA (GPU SVD via torch.pca_lowrank) over real per-pixel embeddings, or load
-    a cached fit from a previous run. Returns (mean, components, explained_variance) as
-    numpy arrays -- components has shape (k, 128)."""
-    if os.path.exists(path):
-        ckpt = torch.load(path, map_location="cpu")
-        if ckpt["k"] == k:
-            return ckpt["mean"].numpy(), ckpt["components"].numpy(), ckpt["explained_variance"].numpy()
+def pool_real_pixels(embeddings, coords, seed=0, max_pixels=200_000):
+    """Pool per-pixel embedding vectors from training patches across all regions,
+    subsampled for speed. Shared by PCA fitting (this module) and the region
+    classifier's reference bank (classify.py) -- both need a representative sample of
+    real embeddings.
 
+    embeddings: list of (H_i, W_i, 128) normalized arrays, one per config.REGIONS entry.
+    coords: (N, 3) array of (region_idx, y, x) patch top-left corners.
+    """
     p = config.PATCH_SIZE
     pixels = np.concatenate(
-        [embedding_norm[y : y + p, x : x + p, :].reshape(-1, config.EMBEDDING_DIM) for y, x in train_coords],
+        [embeddings[r][y : y + p, x : x + p, :].reshape(-1, config.EMBEDDING_DIM) for r, y, x in coords],
         axis=0,
     )
     rng = np.random.default_rng(seed)
     if len(pixels) > max_pixels:
         idx = rng.choice(len(pixels), size=max_pixels, replace=False)
         pixels = pixels[idx]
+    return pixels
 
+
+def fit_or_load_pca(embeddings, coords, k=config.PCA_COMPONENTS, seed=0,
+                     path=config.PCA_CACHE, device="cpu", max_pixels=200_000):
+    """Fit PCA (GPU SVD via torch.pca_lowrank) over real per-pixel embeddings pooled
+    across all regions, or load a cached fit from a previous run. Returns
+    (mean, components, explained_variance) as numpy arrays -- components has shape
+    (k, 128)."""
+    if os.path.exists(path):
+        ckpt = torch.load(path, map_location="cpu")
+        if ckpt["k"] == k:
+            return ckpt["mean"].numpy(), ckpt["components"].numpy(), ckpt["explained_variance"].numpy()
+
+    pixels = pool_real_pixels(embeddings, coords, seed=seed, max_pixels=max_pixels)
     pixels_t = torch.from_numpy(pixels).float().to(device)
     mean = pixels_t.mean(dim=0)
     centered = pixels_t - mean
