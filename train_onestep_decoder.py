@@ -12,7 +12,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 import config
 from dataset import load_patches
@@ -67,6 +67,11 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument(
+        "--full-dataset",
+        action="store_true",
+        help="train on all patches (train+val combined), no held-out validation -- for the final production run",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,9 +81,13 @@ def main():
         torch.backends.cudnn.benchmark = False
 
     train_ds, val_ds = load_patches()
-    print(f"Train patches: {len(train_ds)}, val patches: {len(val_ds)}")
+    if args.full_dataset:
+        train_ds = ConcatDataset([train_ds, val_ds])
+        print(f"Full-dataset mode: training on {len(train_ds)} patches, no held-out validation")
+    else:
+        print(f"Train patches: {len(train_ds)}, val patches: {len(val_ds)}")
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     model = OneStepDecoder(in_ch=config.EMBEDDING_DIM).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -100,15 +109,22 @@ def main():
             running += loss.item() * embedding.size(0)
 
         train_loss = running / len(train_ds)
-        val_loss = run_validation(model, val_loader, device)
-        print(
-            f"epoch {epoch + 1}/{args.epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}"
-        )
 
-        if val_loss < best_val:
-            best_val = val_loss
-            torch.save({"model_state_dict": model.state_dict(), "val_loss": val_loss}, config.ONESTEP_CHECKPOINT)
-            print(f"  saved new best checkpoint (val_loss={val_loss:.4f})")
+        if args.full_dataset:
+            print(f"epoch {epoch + 1}/{args.epochs}  train_loss={train_loss:.4f}")
+            if train_loss < best_val:
+                best_val = train_loss
+                torch.save({"model_state_dict": model.state_dict(), "train_loss": train_loss}, config.ONESTEP_CHECKPOINT)
+                print(f"  saved new best checkpoint (train_loss={train_loss:.4f})")
+        else:
+            val_loss = run_validation(model, val_loader, device)
+            print(
+                f"epoch {epoch + 1}/{args.epochs}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}"
+            )
+            if val_loss < best_val:
+                best_val = val_loss
+                torch.save({"model_state_dict": model.state_dict(), "val_loss": val_loss}, config.ONESTEP_CHECKPOINT)
+                print(f"  saved new best checkpoint (val_loss={val_loss:.4f})")
 
     print(f"Done. Best val_loss={best_val:.4f}, checkpoint at {config.ONESTEP_CHECKPOINT}")
 

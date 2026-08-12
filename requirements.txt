@@ -3,6 +3,7 @@ pystac-client
 planetary-computer
 rasterio
 numpy
+scipy
 scikit-learn
 scikit-image
 --extra-index-url https://download.pytorch.org/whl/cu126
